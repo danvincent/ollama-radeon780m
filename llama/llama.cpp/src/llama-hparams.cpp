@@ -74,14 +74,48 @@ uint32_t llama_hparams::n_embd_inp() const {
 
 uint32_t llama_hparams::n_embd_k_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
-
-    return n_embd_head_k * n_head_kv;
+    // For SWA layers, use SWA-specific head dimension; otherwise use default
+    const uint32_t n_embd_head = is_swa(il) ? n_embd_head_k_swa : n_embd_head_k;
+    
+    return n_embd_head * n_head_kv;
 }
 
 uint32_t llama_hparams::n_embd_v_gqa(uint32_t il) const {
     const uint32_t n_head_kv = this->n_head_kv(il);
+    // For SWA layers, use SWA-specific head dimension; otherwise use default
+    const uint32_t n_embd_head = is_swa(il) ? n_embd_head_v_swa : n_embd_head_v;
+    
+    return n_embd_head * n_head_kv;
+}
 
-    return n_embd_head_v * n_head_kv;
+// Helper: get per-layer K head dimension (single head width, not multiplied by n_head_kv)
+// Used by KV cache code to determine the correct head width for each layer
+uint32_t llama_hparams::get_head_dim_k(uint32_t il) const {
+    // For SWA layers, use SWA-specific head dimension; otherwise use default
+    return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k;
+}
+
+// Helper: get per-layer V head dimension (single head width, not multiplied by n_head_kv)
+// Used by KV cache code to determine the correct head width for each layer
+uint32_t llama_hparams::get_head_dim_v(uint32_t il) const {
+    // For SWA layers, use SWA-specific head dimension; otherwise use default
+    return is_swa(il) ? n_embd_head_v_swa : n_embd_head_v;
+}
+
+// Validate K/V head width equality for the given layer
+// For Gemma4 and other models with SWA, K and V head widths should match
+bool llama_hparams::is_head_dims_consistent(uint32_t il) const {
+    return get_head_dim_k(il) == get_head_dim_v(il);
+}
+
+// Check if all layers have consistent K/V head widths
+bool llama_hparams::are_all_head_dims_consistent() const {
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (!is_head_dims_consistent(il)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool llama_hparams::is_n_embd_k_gqa_variable() const {

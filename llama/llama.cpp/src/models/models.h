@@ -214,6 +214,17 @@ struct llm_build_gemma : public llm_graph_context {
     llm_build_gemma(const llama_model & model, const llm_graph_params & params);
 };
 
+struct llm_build_gemma4 : public llm_graph_context {
+    const llama_model & model;
+    const int64_t n_embd_per_layer;
+
+    llm_build_gemma4(const llama_model & model, const llm_graph_params & params);
+
+private:
+    ggml_tensor * build_inp_per_layer();
+    ggml_tensor * project_per_layer_inputs(ggml_tensor * inp_batch, ggml_tensor * inp_per_layer);
+};
+
 struct llm_build_glm4 : public llm_graph_context {
     llm_build_glm4(const llama_model & model, const llm_graph_params & params);
 };

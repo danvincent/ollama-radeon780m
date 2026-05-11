@@ -44,6 +44,7 @@ struct llama_hparams {
     uint32_t n_embd_features = 0;
     uint32_t n_layer;
     int32_t n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
+    uint32_t n_kv_shared_layers = 0;    // for Gemma4: number of layers that share KV cache (0 = no sharing, validated: must be <= n_layer)
     uint32_t n_rot;
     uint32_t n_embd_head_k; // dimension of keys (d_k). d_q is assumed to be the same, but there are n_head q heads, and only n_head_kv k-v heads
     uint32_t n_embd_head_v; // dimension of values (d_v) aka n_embd_head
@@ -54,6 +55,10 @@ struct llama_hparams {
     // note: deepseek2 using MLA converts into MQA with larger heads, then decompresses to MHA
     uint32_t n_embd_head_k_mla = 0;
     uint32_t n_embd_head_v_mla = 0;
+
+    // for Gemma4: alternative attention head dimensions for SWA (Sliding Window Attention)
+    uint32_t n_embd_head_k_swa = 0;
+    uint32_t n_embd_head_v_swa = 0;
 
     // for WavTokenizer
     struct llama_hparams_posnet   posnet;
@@ -176,6 +181,9 @@ struct llama_hparams {
     uint32_t laurel_rank  = 64;
     uint32_t n_embd_altup = 256;
 
+    // gemma4 per-layer embeddings
+    uint32_t n_embd_per_layer = 0;
+
     // needed for sentence-transformers dense layers
     uint32_t dense_2_feat_in  = 0;  // in_features of the 2_Dense
     uint32_t dense_2_feat_out = 0;  // out_features of the 2_Dense
@@ -240,6 +248,17 @@ struct llama_hparams {
 
     // dimension of value embeddings across all k-v heads
     uint32_t n_embd_v_gqa(uint32_t il = 0) const;
+
+    // per-layer head dimensions (single head width for K and V, not multiplied by n_head_kv)
+    // These are used by KV cache code to determine the correct head width for each layer
+    // For Gemma4: returns SWA-specific dimensions for SWA layers, regular dimensions for dense layers
+    uint32_t get_head_dim_k(uint32_t il = 0) const;
+    uint32_t get_head_dim_v(uint32_t il = 0) const;
+
+    // Validation: check if K/V head widths are consistent (equal) for the given layer
+    // For Gemma4 and other models with SWA, K and V head widths should match
+    bool is_head_dims_consistent(uint32_t il = 0) const;
+    bool are_all_head_dims_consistent() const;
 
     // true if any layer has a different n_embd_k_gqa/n_embd_v_gqa
     bool is_n_embd_k_gqa_variable() const;

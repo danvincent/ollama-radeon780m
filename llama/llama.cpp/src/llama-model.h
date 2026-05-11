@@ -122,8 +122,10 @@ enum llm_type {
     LLM_TYPE_235B_A22B,
     LLM_TYPE_300B_A47B, // Ernie MoE big
     LLM_TYPE_355B_A32B, // GLM-4.5
+    LLM_TYPE_26B_A4B, // Gemma4
     LLM_TYPE_E2B,
     LLM_TYPE_E4B,
+    LLM_TYPE_31B,
 };
 
 std::string llama_rope_scaling_type_name(llama_rope_scaling_type rope_scaling_type);
@@ -271,13 +273,20 @@ struct llama_layer {
 
     // ff MoE
     struct ggml_tensor * ffn_gate_inp    = nullptr;
+    struct ggml_tensor * ffn_gate_inp_s  = nullptr;  // router scale (Gemma4)
     struct ggml_tensor * ffn_gate_exps   = nullptr;
     struct ggml_tensor * ffn_down_exps   = nullptr;
     struct ggml_tensor * ffn_up_exps     = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps = nullptr; // fused gate+up (Gemma4)
     struct ggml_tensor * ffn_gate_inp_b  = nullptr;
     struct ggml_tensor * ffn_gate_exps_b = nullptr;
     struct ggml_tensor * ffn_down_exps_b = nullptr;
     struct ggml_tensor * ffn_up_exps_b   = nullptr;
+
+    // MoE dual-path norms (Gemma4)
+    struct ggml_tensor * ffn_pre_norm_2  = nullptr;   // pre-FFN norm for dual-path
+    struct ggml_tensor * ffn_post_norm_1 = nullptr;   // post-shared-expert norm
+    struct ggml_tensor * ffn_post_norm_2 = nullptr;   // post-expert-sum norm
 
     // ff shared expert (shexp)
     struct ggml_tensor * ffn_gate_inp_shexp = nullptr;
@@ -368,6 +377,9 @@ struct llama_layer {
     struct ggml_tensor * rope_short = nullptr;
     struct ggml_tensor * rope_freqs = nullptr;
 
+    // layer output scale (Gemma4)
+    struct ggml_tensor * out_scale  = nullptr;
+
     // bitnet scale
     struct ggml_tensor * wq_scale       = nullptr;
     struct ggml_tensor * wk_scale       = nullptr;
@@ -450,12 +462,13 @@ struct llama_model {
     struct ggml_tensor * conv1d   = nullptr;
     struct ggml_tensor * conv1d_b = nullptr;
 
-    // gemma3n altup
-    struct ggml_tensor * tok_embd_per_layer   = nullptr;
-    struct ggml_tensor * altup_proj           = nullptr;
-    struct ggml_tensor * altup_unembd_proj    = nullptr;
-    struct ggml_tensor * per_layer_model_proj = nullptr;
-    struct ggml_tensor * per_layer_proj_norm  = nullptr;
+    // gemma3n altup and gemma4 per-layer embeddings
+    struct ggml_tensor * tok_embd_per_layer    = nullptr;
+    struct ggml_tensor * per_layer_tok_embd    = nullptr;  // Gemma4 per-layer token embeddings
+    struct ggml_tensor * altup_proj            = nullptr;
+    struct ggml_tensor * altup_unembd_proj     = nullptr;
+    struct ggml_tensor * per_layer_model_proj  = nullptr;
+    struct ggml_tensor * per_layer_proj_norm   = nullptr;
 
     std::vector<llama_layer> layers;
 

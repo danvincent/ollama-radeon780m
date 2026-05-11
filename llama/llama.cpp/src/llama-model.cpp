@@ -128,6 +128,8 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_235B_A22B:     return "235B.A22B";
         case LLM_TYPE_300B_A47B:     return "300B.A47B";
         case LLM_TYPE_355B_A32B:     return "355B.A32B";
+        case LLM_TYPE_26B_A4B:       return "26B.A4B";
+        case LLM_TYPE_31B:           return "31B";
         case LLM_TYPE_E2B:           return "E2B";
         case LLM_TYPE_E4B:           return "E4B";
         default:                     return "?B";
@@ -1313,6 +1315,57 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 switch (hparams.n_layer) {
                     case 30: type = LLM_TYPE_E2B; break;
                     case 35: type = LLM_TYPE_E4B; break;
+                    default: type = LLM_TYPE_UNKNOWN;
+                }
+            } break;
+        case LLM_ARCH_GEMMA4:
+            {
+                hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+                ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+
+                uint32_t n_kv_shared_layers = 0;
+                ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
+
+                // Phase 1 hardening: validate shared_kv_layers bounds
+                // Constraint: 0 <= n_kv_shared_layers <= n_layer
+                // Without this check, invalid values silently collapse into incorrect has_kv() behavior
+                if (n_kv_shared_layers > hparams.n_layer) {
+                    throw std::runtime_error(
+                        "invalid shared_kv_layers metadata: " + std::to_string(n_kv_shared_layers) +
+                        " exceeds n_layer=" + std::to_string(hparams.n_layer)
+                    );
+                }
+
+                // Store the validated value for diagnostics and potential future use
+                hparams.n_kv_shared_layers = n_kv_shared_layers;
+
+                // Compute the split point for KV cache: first N layers own KV, rest share
+                hparams.n_layer_kv_from_start = hparams.n_layer - (int32_t)n_kv_shared_layers;
+                hparams.f_attention_scale     = 1.0f; // Gemma4 uses self.scaling = 1.0 (no pre-attn scaling)
+
+                ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
+                ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,  hparams.n_ff_exp, false);
+                ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+                ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+                ml.get_key(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,  hparams.n_embd_per_layer);
+                ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,    hparams.n_embd_head_k_swa);
+                ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,  hparams.n_embd_head_v_swa);
+                ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
+
+                // Validate K/V head width equality for Gemma4
+                // When SWA head dims are specified, they must match each other
+                if (hparams.n_embd_head_k_swa != 0 || hparams.n_embd_head_v_swa != 0) {
+                    if (hparams.n_embd_head_k_swa != hparams.n_embd_head_v_swa) {
+                        LLAMA_LOG_WARN("%s: Gemma4 SWA head dimensions mismatch: K=%u, V=%u (should be equal)\n",
+                            __func__, hparams.n_embd_head_k_swa, hparams.n_embd_head_v_swa);
+                    }
+                }
+
+                switch (hparams.n_layer) {
+                    case 30: type = LLM_TYPE_26B_A4B; break;
+                    case 35: type = LLM_TYPE_E2B; break;
+                    case 42: type = LLM_TYPE_E4B; break;
+                    case 60: type = LLM_TYPE_31B; break;
                     default: type = LLM_TYPE_UNKNOWN;
                 }
             } break;
@@ -3974,6 +4027,130 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
                         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
                         layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
+                    }
+                } break;
+            case LLM_ARCH_GEMMA4:
+                {
+                    // Phase 1: Complete metadata tensor loading (full graph execution deferred to Phase 2)
+                    const uint32_t n_embd_per_layer = hparams.n_embd_per_layer;
+                    const int64_t  n_ff_exp         = hparams.n_ff_exp;
+
+                    // Token embeddings
+                    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+                    // Per-layer embeddings (if enabled)
+                    if (n_embd_per_layer > 0) {
+                        per_layer_tok_embd   = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),    {n_embd_per_layer * n_layer, n_vocab}, 0);
+                        per_layer_model_proj = create_tensor(tn(LLM_TENSOR_PER_LAYER_MODEL_PROJ, "weight", 0), {n_embd, n_embd_per_layer * n_layer}, 0);
+                        per_layer_proj_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ_NORM,  "weight", 0), {n_embd_per_layer}, 0);
+                    }
+
+                    // Output layer
+                    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+                    output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+
+                    // if output is NULL, init from the input tok embed
+                    if (output == NULL) {
+                        output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+                    }
+
+                    // RoPE frequencies tracking
+                    int rope_freqs_flag = 0;
+
+                    for (int i = 0; i < n_layer; ++i) {
+                        auto & layer = layers[i];
+                        const int64_t n_head      = hparams.n_head(i);
+                        const int64_t n_head_kv  = hparams.n_head_kv(i);
+                        const int64_t n_embd_head_k = hparams.n_embd_head_k;
+                        const int64_t n_embd_head_v = hparams.n_embd_head_v;
+                        const int     kv_flags    = hparams.has_kv(i) ? 0 : TENSOR_NOT_REQUIRED;
+                        
+                        // Determine if this is a SWA layer or full attention layer
+                        const bool is_swa_layer = hparams.swa_layers[i];
+                        
+                        // Use appropriate head dimensions based on layer type
+                        // For SWA layers, use SWA-specific head dims if available; else fall back to regular
+                        const int64_t layer_n_embd_head = is_swa_layer && hparams.n_embd_head_k_swa != 0
+                            ? hparams.n_embd_head_k_swa
+                            : n_embd_head_k;
+                        
+                        // For SWA layers, recalculate K/V dimensions using SWA-specific head dims
+                        // instead of global head dims to ensure correct tensor shapes.
+                        // Shared-KV layers (has_kv(i) == false) don't create K/V tensors, so this
+                        // calculation is only used when the layer has its own KV cache.
+                        const int64_t n_embd_k = is_swa_layer && hparams.n_embd_head_k_swa != 0
+                            ? hparams.n_embd_head_k_swa * n_head_kv
+                            : hparams.n_embd_k_gqa(i);
+                        const int64_t n_embd_v = is_swa_layer && hparams.n_embd_head_v_swa != 0
+                            ? hparams.n_embd_head_v_swa * n_head_kv
+                            : hparams.n_embd_v_gqa(i);
+
+                        // Attention normalization
+                        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+                        // Q/K normalization (use layer-specific head dims)
+                        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {layer_n_embd_head}, 0);
+                        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {layer_n_embd_head}, kv_flags);
+
+                        // Attention weights (use layer-specific head dims for Q/O, GQA dims for K/V)
+                        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", i), {n_embd, layer_n_embd_head * n_head}, 0);
+                        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", i), {n_embd, n_embd_k}, kv_flags);
+                        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V, "weight", i), {n_embd, n_embd_v}, kv_flags);
+                        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {layer_n_embd_head * n_head, n_embd}, 0);
+
+                        // Post-attention normalization
+                        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
+
+                        // Optional layer output scale
+                        layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
+
+                        // RoPE frequencies for full-attention layers (proportional rotation)
+                        if (!is_swa_layer) {
+                            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {layer_n_embd_head/2}, rope_freqs_flag);
+                            rope_freqs_flag = TENSOR_DUPLICATED;
+                        }
+
+                        // FFN tensors (handle double-wide MLP per layer)
+                        const int64_t n_ff_cur = hparams.n_ff(i);
+
+                        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+                        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff_cur}, 0);
+                        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff_cur}, 0);
+                        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd}, 0);
+                        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
+
+                        // MoE router (optional; presence indicates MoE layer)
+                        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, TENSOR_NOT_REQUIRED);
+                        bool has_expert = layer.ffn_gate_inp != nullptr;
+
+                        // MoE-specific tensors
+                        if (has_expert) {
+                            // Router scale
+                            layer.ffn_gate_inp_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "scale", i), {n_embd}, 0);
+
+                            // Dual-path normalization tensors
+                            layer.ffn_pre_norm_2  = create_tensor(tn(LLM_TENSOR_FFN_PRE_NORM_2,  "weight", i), {n_embd}, 0);
+                            layer.ffn_post_norm_1 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_1, "weight", i), {n_embd}, 0);
+                            layer.ffn_post_norm_2 = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM_2, "weight", i), {n_embd}, 0);
+
+                            // MoE FFN: try fused gate+up first, fallback to separate
+                            layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", i), {n_embd, n_ff_exp * 2, n_expert}, TENSOR_NOT_REQUIRED);
+
+                            if (layer.ffn_gate_up_exps == nullptr) {
+                                layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                                layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd, n_ff_exp, n_expert}, 0);
+                            }
+
+                            // Expert down projection (always separate)
+                            layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd, n_expert}, 0);
+                        }
+
+                        // Per-layer embeddings (if enabled)
+                        if (n_embd_per_layer > 0) {
+                            layer.per_layer_inp_gate   = create_tensor(tn(LLM_TENSOR_PER_LAYER_INP_GATE,  "weight", i), {n_embd, n_embd_per_layer}, 0);
+                            layer.per_layer_proj       = create_tensor(tn(LLM_TENSOR_PER_LAYER_PROJ,      "weight", i), {n_embd_per_layer, n_embd}, 0);
+                            layer.per_layer_post_norm  = create_tensor(tn(LLM_TENSOR_PER_LAYER_POST_NORM, "weight", i), {n_embd}, 0);
+                        }
                     }
                 } break;
             case LLM_ARCH_GEMMA3N:
@@ -7197,6 +7374,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
 
                             return -1;
                         };
+                    } else if (arch == LLM_ARCH_GEMMA4) {
+                        reuse = [&](int32_t il) {
+                            if (il >= (int32_t) hparams.n_layer_kv_from_start) {
+                                return (int32_t) hparams.n_layer_kv_from_start - (hparams.is_swa(il) ? 2 : 1);
+                            }
+
+                            return -1;
+                        };
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -7417,6 +7602,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
         case LLM_ARCH_GEMMA3N:
             {
                 llm = std::make_unique<llm_build_gemma3n_iswa>(*this, params);
+            } break;
+        case LLM_ARCH_GEMMA4:
+            {
+                llm = std::make_unique<llm_build_gemma4>(*this, params);
             } break;
         case LLM_ARCH_GEMMA_EMBEDDING:
             {
@@ -7884,6 +8073,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA:
         case LLM_ARCH_GEMMA2:
         case LLM_ARCH_GEMMA3:
+        case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_STARCODER2:
