@@ -214,7 +214,9 @@ func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cac
 
 		var perLayerInput ml.Tensor
 		if perLayerInputs != nil {
-			perLayerInput = perLayerInputs.View(ctx, i*perLayerInputs.Stride(1), perLayerInputs.Dim(0), perLayerInputs.Stride(2), perLayerInputs.Dim(2))
+			// perLayerInputs shape: [pleDim, nTokens, nLayer] (contiguous, per-layer on 3rd axis)
+			// Extract layer i as a contiguous [pleDim, nTokens] view.
+			perLayerInput = perLayerInputs.View(ctx, i*perLayerInputs.Stride(2), perLayerInputs.Dim(0), perLayerInputs.Stride(1), perLayerInputs.Dim(1))
 		}
 
 		// KV sharing: layers >= firstShared reuse K/V from donor layers
@@ -253,7 +255,10 @@ func (p *PerLayerProjector) Forward(ctx ml.Context, batch input.Batch, inputs ml
 		perLayerProjection = perLayerProjection.Scale(ctx, 1/math.Sqrt(2))
 	}
 
-	return perLayerProjection
+	// Permute [pleDim, nLayer, nTokens] → [pleDim, nTokens, nLayer] and make contiguous.
+	// This matches llama.cpp's ggml_cont(ggml_permute(inp_per_layer, 0,2,1,3))
+	// and ensures each per-layer slice is a contiguous 2D tensor.
+	return perLayerProjection.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
 }
 
 type TextSelfAttention struct {
