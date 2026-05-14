@@ -51,7 +51,7 @@ No. The ollama-embedded llama.cpp has diverged from upstream (custom patches at 
 
 ## Symptom
 
-- **CPU run:** Correct English output (proper list of 50 US states).
+- **CPU run:** Also gibberish (different wrong languages) — same code path as Vulkan for the PLE bug
 - **Vulkan run:** Thai/off-topic fantasy prose completely unrelated to the prompt.
 - **Vulkan IS active (confirmed):** 42/43 layers offloaded to GPU; `library=Vulkan`; `AMD Radeon 780M Graphics (RADV PHOENIX)` detected in logs.
 - **Large allocation failure observed:** `alloc_tensor_range: failed to allocate Vulkan0 buffer of size 5637144576` (~5.25 GiB).
@@ -69,6 +69,55 @@ The following changes are committed in the working tree but did **not** fix the 
 4. **`ggml_mul_mat_id_set_prec()` API added to GGML** (`ggml.h`, `ggml.c`) and wired into the Vulkan backend (`ggml-vulkan.cpp`).
 5. **Phase 1 original: `ml/path.go`** — source-build library path auto-discovery.
 6. **Phase 2 original: ISWA attention F32 precision.**
+
+---
+
+## Final Resolution (CONFIRMED FIXED — commit `786f76ff`)
+
+### Root Cause: Non-contiguous Per-Layer Input tensor in Vulkan element-wise ops
+
+**File:** `model/models/gemma4/model_text.go`
+
+#### What was wrong
+
+`PerLayerProjector.Forward` returned the per-layer inputs tensor with shape `[pleDim, nLayer, nTokens]`.
+In `TextModel.Forward`, each layer's PLE slice was extracted as a **strided non-contiguous 2D view**:
+- Stride for the token dimension = `pleDim × nLayer × sizeof(float)` (not the natural `pleDim × sizeof`)
+- This non-contiguous tensor was then used in `ggml_geglu_split` (element-wise GELU-gate × perLayerInput)
+
+The Vulkan GGML backend's element-wise kernels do not correctly handle non-contiguous tensors, producing
+garbage values for all 42 Gemma4 layers. (The CPU backend handles non-contiguous strides natively, but
+still produced wrong output because both paths hit the same strided view.)
+
+#### What llama.cpp does (the reference)
+
+`project_per_layer_inputs()` in `gemma4.cpp` explicitly calls:
+```cpp
+inp_per_layer = ggml_cont(ggml_permute(inp_per_layer, 0, 2, 1, 3));
+```
+This permutes `[pleDim, nLayer, nTokens]` → `[pleDim, nTokens, nLayer]` and makes it contiguous,
+so each per-layer slice `[pleDim, nTokens]` extracted by `view_2d_slice` is fully contiguous.
+
+#### The fix
+
+In `PerLayerProjector.Forward`, changed the return to:
+```go
+return perLayerProjection.Permute(ctx, 0, 2, 1, 3).Contiguous(ctx)
+```
+
+In `TextModel.Forward`, updated the View extraction to match the new `[pleDim, nTokens, nLayer]` layout:
+```go
+// perLayerInputs: [pleDim, nTokens, nLayer] — contiguous, per-layer slices on 3rd axis
+perLayerInput = perLayerInputs.View(ctx, i*perLayerInputs.Stride(2),
+    perLayerInputs.Dim(0), perLayerInputs.Stride(1), perLayerInputs.Dim(1))
+```
+`Stride(1) = pleDim × sizeof` is the natural contiguous stride — resulting view IS contiguous. ✓
+
+#### Verification
+
+- **Gemma4 8B Q4_K_M** on RADV PHOENIX (Vulkan): correctly listed all 50 US states in English ✅
+- **Qwen3 regression test**: `2+2=4` ✅
+- Commit: `786f76ff` on branch `radeon-780m-support-attempt-1`
 
 ---
 
