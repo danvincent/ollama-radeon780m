@@ -57,7 +57,7 @@ systemctl stop ollama || true
 
 # Step 5: Remove apt package
 print_info "Removing apt-installed ollama package..."
-apt-get remove --purge -y ollama || true
+apt remove --purge -y ollama || true
 
 # Step 6: Remove old binaries
 print_info "Removing old ollama binaries..."
@@ -96,7 +96,17 @@ else
   print_warning "Service file not found at /etc/systemd/system/ollama.service"
 fi
 
-# Step 11: Reload and restart service
+# Step 11: Configure firewall (firewalld)
+print_info "Configuring firewall (firewalld)..."
+if command -v firewall-cmd &>/dev/null; then
+  firewall-cmd --permanent --add-port=11434/tcp
+  firewall-cmd --reload
+  print_success "Port 11434/tcp opened in firewalld"
+else
+  print_warning "firewall-cmd not found — skipping firewall config (open port 11434/tcp manually if needed)"
+fi
+
+# Step 12: Reload and restart service
 print_info "Reloading systemd configuration and restarting service..."
 systemctl daemon-reload
 systemctl enable ollama
