@@ -140,6 +140,20 @@ func LoadModel(model string, maxArraySize int) (*ggml.GGML, error) {
 	return ggml, err
 }
 
+// gemma4FAGuardShouldDisable returns true when flash attention must be disabled for
+// Gemma4 because the GPU cannot handle its 512-dim K/V heads correctly.
+func gemma4FAGuardShouldDisable(arch string, gpus []ml.DeviceInfo) bool {
+	if arch != "gemma4" {
+		return false
+	}
+	for _, gpu := range gpus {
+		if gpu.Library == "Vulkan" || (gpu.Library == "CUDA" && (gpu.ComputeMajor < 7 || (gpu.ComputeMajor == 7 && gpu.ComputeMinor < 5))) {
+			return true
+		}
+	}
+	return false
+}
+
 // NewLlamaServer will run a server for the given GPUs
 func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath string, f *ggml.GGML, adapters, projectors []string, opts api.Options, numParallel int) (LlamaServer, error) {
 	var llamaModel *llama.Model
@@ -212,14 +226,17 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 
 	// Gemma 4's 512-dim attention heads require MMA FA kernels (Turing+, compute >= 7.5).
 	// Older CUDA GPUs only have tile/vec FA kernels which abort on dk512 non-GQA attention.
-	if fa && f.KV().Architecture() == "gemma4" {
+	// Vulkan FA path also cannot handle 512-dim K/V heads correctly, causing incoherent output.
+	if fa && gemma4FAGuardShouldDisable(f.KV().Architecture(), gpus) {
+		reason := "vulkan"
 		for _, gpu := range gpus {
-			if gpu.Library == "CUDA" && (gpu.ComputeMajor < 7 || (gpu.ComputeMajor == 7 && gpu.ComputeMinor < 5)) {
-				slog.Debug("disabling flash attention for gemma4 on pre-Turing GPU", "compute", fmt.Sprintf("%d.%d", gpu.ComputeMajor, gpu.ComputeMinor))
-				fa = false
+			if gpu.Library == "CUDA" {
+				reason = fmt.Sprintf("pre-Turing GPU (compute %d.%d)", gpu.ComputeMajor, gpu.ComputeMinor)
 				break
 			}
 		}
+		slog.Debug("disabling flash attention for gemma4", "reason", reason)
+		fa = false
 	}
 
 	kvct := strings.ToLower(envconfig.KvCacheType())
@@ -232,6 +249,10 @@ func NewLlamaServer(systemInfo ml.SystemInfo, gpus []ml.DeviceInfo, modelPath st
 			} else {
 				flashAttention = ml.FlashAttentionDisabled
 			}
+		} else if !fa {
+			// FA was disabled by a safety guard (e.g., Gemma4 on Vulkan/pre-Turing).
+			// Propagate the guard's decision so the compatibility runner doesn't re-enable it.
+			flashAttention = ml.FlashAttentionDisabled
 		}
 
 		if kvct != "" {
@@ -1672,6 +1693,7 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 	// keep track of the last token generated, this is used to abort if the model starts looping
 	var lastToken string
 	var tokenRepeat int
+	var validActivityOccurred bool // tracks if any response with valid completion activity was generated
 
 	for scanner.Scan() {
 		select {
@@ -1693,34 +1715,54 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 			if err := json.Unmarshal(evt, &c); err != nil {
 				return fmt.Errorf("error unmarshalling llm prediction response: %v", err)
 			}
-			switch {
-			case strings.TrimSpace(c.Content) == lastToken:
-				tokenRepeat++
-			default:
-				lastToken = strings.TrimSpace(c.Content)
-				tokenRepeat = 0
+
+			// Token-repeat detection: only track repeats for actual text content.
+			// Progress/image chunks without text (empty Content but Step > 0 or Image != "")
+			// are excluded to prevent false abort on long progress streams.
+			trimmedContent := strings.TrimSpace(c.Content)
+			isProgressOrImageUpdate := (trimmedContent == "") && (c.Step > 0 || c.Image != "")
+
+			if !isProgressOrImageUpdate {
+				// Only apply token-repeat logic to text content
+				switch {
+				case trimmedContent == lastToken:
+					tokenRepeat++
+				default:
+					lastToken = trimmedContent
+					tokenRepeat = 0
+				}
+
+				// 30 picked as an arbitrary max token repeat limit, modify as needed
+				if tokenRepeat > 30 {
+					slog.Debug("prediction aborted, token repeat limit reached")
+					// Token repeat abort is not a context cancellation, so return a proper error
+					return fmt.Errorf("token repeat limit reached")
+				}
 			}
 
-			// 30 picked as an arbitrary max token repeat limit, modify as needed
-			if tokenRepeat > 30 {
-				slog.Debug("prediction aborted, token repeat limit reached")
-				return ctx.Err()
+			// Track if any response has valid completion activity (using the same logic as validation)
+			if hasValidCompletionActivity(c) {
+				validActivityOccurred = true
 			}
 
-			if c.Content != "" {
-				fn(CompletionResponse{
-					Content:  c.Content,
-					Logprobs: c.Logprobs,
-				})
-			}
-
-			if c.Done {
+			// Handle streaming and Done logic
+			if !c.Done {
+				// Always call fn() for non-Done chunks
 				fn(c)
+			} else {
+				// Done chunk - call fn() if we had any valid activity, or if this Done chunk itself has valid activity
+				if validActivityOccurred || hasValidCompletionActivity(c) {
+					fn(c)
+				} else {
+					// Done chunk with no content generated and no meaningful data
+					return fmt.Errorf("no content generated")
+				}
 				return nil
 			}
 		}
 	}
 
+	// If we exit the loop without a Done chunk, that's an error
 	if err := scanner.Err(); err != nil {
 		if strings.Contains(err.Error(), "unexpected EOF") || strings.Contains(err.Error(), "forcibly closed") {
 			s.Close()
@@ -1736,7 +1778,8 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 		return fmt.Errorf("error reading llm response: %v", err)
 	}
 
-	return nil
+	// Stream ended without Done chunk
+	return fmt.Errorf("stream ended without Done chunk")
 }
 
 type EmbeddingRequest struct {
