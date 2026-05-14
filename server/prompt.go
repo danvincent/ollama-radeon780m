@@ -58,7 +58,8 @@ func chatPrompt(ctx context.Context, m *Model, tokenize tokenizeFunc, opts *api.
 				}
 			}
 
-			if ctxLen <= opts.NumCtx {
+			// Reserve 1 token for BOS that the runner adds during tokenization
+			if ctxLen + 1 <= opts.NumCtx {
 				currMsgIdx = i
 				break
 			}

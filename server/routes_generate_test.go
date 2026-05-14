@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -75,6 +76,15 @@ func (mockRunner) Tokenize(_ context.Context, s string) (tokens []int, err error
 }
 
 func (mockRunner) Ping(_ context.Context) error { return nil }
+
+func (mockRunner) Detokenize(_ context.Context, tokens []int) (string, error) {
+	// Simple detokenization: reconstruct by counting tokens and creating placeholder words
+	words := make([]string, len(tokens))
+	for i := range tokens {
+		words[i] = fmt.Sprintf("word%d", tokens[i])
+	}
+	return strings.Join(words, " "), nil
+}
 
 func (m *mockRunner) ContextLength() int {
 	if m.contextLength > 0 {
@@ -3086,5 +3096,192 @@ func TestGenerateHandlerPreservesNumCtxWhenWithinLimit(t *testing.T) {
 	// Verification: CompletionRequest.Options.NumCtx should be preserved unchanged
 	if mock.CompletionRequest.Options.NumCtx != requestedNumCtx {
 		t.Errorf("expected CompletionRequest.Options.NumCtx preserved at %d, got %d", requestedNumCtx, mock.CompletionRequest.Options.NumCtx)
+	}
+}
+
+func TestGenerateHandlerAccountsForLegacyContextBudget(t *testing.T) {
+	// This test verifies that GenerateHandler properly accounts for deprecated req.Context
+	// when calculating the budget for the prompt via chatPrompt.
+	//
+	// When a user provides both context (list of previously generated tokens) and a new prompt,
+	// the handler should reduce the available budget by the size of the context. This ensures
+	// the total tokens (context + prompt) do not exceed the runner's context window.
+	//
+	// The observable consequence is that the prompt will be truncated based on:
+	// - Available budget = opts.NumCtx - len(req.Context)
+	// This test verifies this by checking that the prompt is actually truncated when a large
+	// context is provided.
+
+	gin.SetMode(gin.TestMode)
+
+	// Set up a mock runner that supports detokenization
+	mock := &mockRunner{
+		contextLength: 2048,
+		CompletionResponse: llm.CompletionResponse{
+			Done:               true,
+			DoneReason:         llm.DoneReasonStop,
+			PromptEvalCount:    1,
+			PromptEvalDuration: 1,
+			EvalCount:          1,
+			EvalDuration:       1,
+		},
+	}
+
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 1),
+			finishedReqCh:   make(chan *LlmRequest, 1),
+			expiredCh:       make(chan *runnerRef, 1),
+			unloadedCh:      make(chan any, 1),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				time.Sleep(time.Millisecond)
+				req.successCh <- &runnerRef{
+					llama: mock,
+				}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(2048),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model:  "test",
+		Files:  map[string]string{"file.gguf": digest},
+		Stream: &stream,
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	// Create a context with 300 tokens (simulating previously generated tokens from a conversation).
+	contextTokens := make([]int, 300)
+	for i := 0; i < 300; i++ {
+		contextTokens[i] = i
+	}
+
+	// Create a prompt with 50 words (50 tokens when mock tokenizer is used: 1 token per word).
+	smallPromptWords := make([]string, 50)
+	for i := 0; i < 50; i++ {
+		smallPromptWords[i] = fmt.Sprintf("word%d", i)
+	}
+	smallPrompt := strings.Join(smallPromptWords, " ")
+
+	// Create a larger prompt with 200 words (200 tokens).
+	largePromptWords := make([]string, 200)
+	for i := 0; i < 200; i++ {
+		largePromptWords[i] = fmt.Sprintf("word%d", i)
+	}
+	largePrompt := strings.Join(largePromptWords, " ")
+
+	// Test 1: Send with small prompt (should fit even when context is accounted for).
+	streamVar := true
+	numCtx := 400 // 400 total tokens available. With 300 context, 100 available for prompt.
+
+	w = createRequest(t, s.GenerateHandler, api.GenerateRequest{
+		Model:   "test",
+		Prompt:  smallPrompt,
+		Context: contextTokens,
+		Options: map[string]any{
+			"num_ctx": numCtx,
+		},
+		Stream: &streamVar,
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("test 1: expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	returnedPrompt1 := mock.CompletionRequest.Prompt
+	if returnedPrompt1 == "" {
+		t.Fatal("test 1: CompletionRequest.Prompt is empty")
+	}
+
+	// Test 2: Send with large prompt (should be truncated when context is accounted for).
+	mock.CompletionRequest.Prompt = "" // Reset for the next test
+
+	w = createRequest(t, s.GenerateHandler, api.GenerateRequest{
+		Model:   "test",
+		Prompt:  largePrompt,
+		Context: contextTokens,
+		Options: map[string]any{
+			"num_ctx": numCtx,
+		},
+		Stream: &streamVar,
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("test 2: expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	returnedPrompt2 := mock.CompletionRequest.Prompt
+	if returnedPrompt2 == "" {
+		t.Fatal("test 2: CompletionRequest.Prompt is empty")
+	}
+
+	// Key assertion: The smaller prompt (test 1) should fit in the context window.
+	// The larger prompt (test 2) should be truncated if context is properly accounted for.
+	//
+	// If the bug exists (context NOT accounted for):
+	// - Available budget = 400 tokens for both tests
+	// - Both the 50-word prompt and 200-word prompt would fit
+	// - returnedPrompt2 would contain most/all of the large prompt
+	//
+	// If the bug is fixed (context IS accounted for):
+	// - Available budget = 400 - 300 = 100 tokens for both tests
+	// - The 50-word prompt fits completely
+	// - The 200-word prompt should be truncated to ~100 tokens
+	// - returnedPrompt2 would be much shorter than returnedPrompt1
+	//
+	// This test verifies that the prompt was actually truncated by comparing the two prompts.
+	// If context is properly accounted for, the large prompt should be significantly truncated.
+
+	// Count tokens in returned prompts by counting words (mock tokenizer logic).
+	tokens1 := len(strings.Fields(returnedPrompt1))
+	tokens2 := len(strings.Fields(returnedPrompt2))
+
+	if tokens1 > 150 {
+		t.Logf("warning: test 1 prompt unexpectedly large (%d tokens, expected ~50)", tokens1)
+	}
+
+	// If context is properly accounted for, returnedPrompt2 should be similar in size to returnedPrompt1
+	// because both are limited to ~100 tokens. If context is NOT accounted for, returnedPrompt2
+	// would be much larger (200+ tokens).
+	//
+	// This assertion will fail if context is not properly accounted for.
+	if tokens2 > 150 {
+		t.Errorf("prompt with large content was not sufficiently truncated when context is provided: "+
+			"got %d tokens in large prompt, expected close to small prompt (%d tokens). "+
+			"This indicates req.Context budget is NOT being accounted for.", tokens2, tokens1)
 	}
 }

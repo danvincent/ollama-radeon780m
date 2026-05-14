@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -441,6 +442,94 @@ func TestRenderPromptResolvesDynamicGemma4Renderer(t *testing.T) {
 
 			if diff := cmp.Diff(got, tt.want); diff != "" {
 				t.Fatalf("rendered prompt mismatch (-got +want):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestChatPromptBOSReserveBoundary(t *testing.T) {
+	// This test verifies the BOS reserve boundary behavior in chatPrompt.
+	// The runner may add a BOS token during tokenization, so chatPrompt should reserve
+	// 1 token when calculating whether messages fit in the context window.
+	//
+	// This test demonstrates that BOS reserve affects which older messages remain included
+	// in the prompt. The test uses multiple messages to show:
+	// - Without BOS reserve, all messages fit in the budget
+	// - With BOS reserve (-1 token effectively), the older message gets dropped,
+	//   but the last message is always preserved (per always-include-last rule)
+
+	tmpl, err := template.Parse(`{{- if .Prompt }}{{ .Prompt }} {{ end }}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := Model{Template: tmpl}
+
+	// Create messages with exact token count.
+	// The mock tokenizer returns one token per word.
+	// "word0 word1 ... word9 " renders to 10 tokens.
+	words := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		words[i] = fmt.Sprintf("word%d", i)
+	}
+	oldMessageContent := strings.Join(words, " ")
+
+	// Create a smaller last message.
+	// "last0 last1" renders to 2 tokens.
+	lastMessageContent := "last0 last1"
+
+	cases := []struct {
+		name                  string
+		numCtx                int
+		// shouldIncludeOldMsg indicates whether we expect the old message to be in the prompt
+		shouldIncludeOldMsg   bool
+		// shouldIncludeLastMsg indicates whether we expect the last message to be in the prompt (always true)
+		shouldIncludeLastMsg  bool
+	}{
+		{
+			name:                 "both messages fit within budget with BOS reserve",
+			numCtx:               13, // 10 (old) + 2 (last) = 12, plus 1 BOS reserve = 13 total, fits exactly
+			shouldIncludeOldMsg:  true,
+			shouldIncludeLastMsg: true,
+		},
+		{
+			name:                 "BOS reserve causes old message to be dropped, but last message remains",
+			numCtx:               12, // Old (10) + Last (2) = 12, 12+1 (BOS) > 12, so old message drops. Last message (2) still included.
+			shouldIncludeOldMsg:  false,
+			shouldIncludeLastMsg: true,
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := api.Options{Runner: api.Runner{NumCtx: tt.numCtx}}
+			msgs := []api.Message{
+				{Role: "user", Content: oldMessageContent},
+				{Role: "assistant", Content: lastMessageContent},
+			}
+			think := false
+
+			prompt, _, err := chatPrompt(t.Context(), &model, mockRunner{}.Tokenize, &opts, msgs, nil, &api.ThinkValue{Value: think}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Verify the last message is always included (per always-include-last rule)
+			if !tt.shouldIncludeLastMsg {
+				t.Fatalf("last message should always be included, but not found in prompt: %q", prompt)
+			}
+			if !strings.Contains(prompt, lastMessageContent) {
+				t.Errorf("expected prompt to contain last message %q, got %q", lastMessageContent, prompt)
+			}
+
+			// Verify old message inclusion as expected
+			if tt.shouldIncludeOldMsg {
+				if !strings.Contains(prompt, oldMessageContent) {
+					t.Errorf("expected prompt to contain old message %q, got %q", oldMessageContent, prompt)
+				}
+			} else {
+				if strings.Contains(prompt, oldMessageContent) {
+					t.Errorf("expected old message to be dropped due to BOS reserve, but found it in prompt: %q", prompt)
+				}
 			}
 		})
 	}
