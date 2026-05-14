@@ -3243,6 +3243,56 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// ggml_mul_mat_id_set_prec - set precision for mul_mat_id operations (for MoE support)
+//
+// This function sets the precision parameter for mul_mat_id operations, which is used
+// by the Vulkan backend to select between f16acc and f32acc pipelines for quantized
+// expert matrix computations in MoE models (e.g., Gemma4).
+//
+// BEHAVIOR:
+// - If tensor 'a' is directly a mul_mat_id: sets precision in op_params[0]
+// - If tensor 'a' is not mul_mat_id: searches immediate sources for mul_mat_id
+//   and sets precision on any found (one-level deep search only)
+//
+// SUPPORTED WRAPPING PATTERNS (one-level):
+// - Direct mul_mat_id: ggml_mul_mat_id_set_prec(mul_mat_id_op, prec)
+// - LoRA-wrapped (one level): ggml_mul_mat_id_set_prec(ggml_add(mul_mat_id, delta), prec)
+//   This handles build_lora_mm_id which returns ggml_add when LoRAs are active
+//
+// LIMITATION:
+// - Only searches one level deep in the computation graph
+// - Does not recursively search deeper dependencies
+// - For multi-level wrapping, the caller must set precision directly on the mul_mat_id
+//
+// PRECISION VALUES:
+// - GGML_PREC_DEFAULT: Prefer f16acc if device supports it
+// - GGML_PREC_F32: Force f32acc for higher precision
+void ggml_mul_mat_id_set_prec(
+        struct ggml_tensor * a,
+        enum ggml_prec       prec) {
+    if (a == NULL) {
+        return;
+    }
+
+    // Case 1: Direct mul_mat_id tensor
+    if (a->op == GGML_OP_MUL_MAT_ID) {
+        const int32_t prec_i32 = (int32_t) prec;
+        ggml_set_op_params_i32(a, 0, prec_i32);
+        return;
+    }
+
+    // Case 2: One-level wrapped tensor (e.g., ggml_add from LoRA wrapping)
+    // Search immediate sources for mul_mat_id operations
+    // This handles build_lora_mm_id which returns ggml_add(mul_mat_id, lora_contribution)
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        struct ggml_tensor * src = a->src[i];
+        if (src != NULL && src->op == GGML_OP_MUL_MAT_ID) {
+            const int32_t prec_i32 = (int32_t) prec;
+            ggml_set_op_params_i32(src, 0, prec_i32);
+        }
+    }
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

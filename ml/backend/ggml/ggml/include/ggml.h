@@ -1412,6 +1412,11 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // set precision for indirect matrix multiplication
+    GGML_API void ggml_mul_mat_id_set_prec(
+            struct ggml_tensor * a,
+            enum ggml_prec       prec);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
