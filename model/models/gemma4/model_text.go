@@ -29,6 +29,8 @@ type TextOptions struct {
 	ropeLocalBase     float32
 	partialRotaryDims int // RoPE dims for full-attention (global) layers
 
+	RopeFactors ml.Tensor // proportional RoPE freq_factors for global attention layers
+
 	slidingWindowPattern []bool
 	// kvDonorMap maps shared layer index -> donor layer index.
 	// Donor is the last non-shared layer of the same type (sliding/full).
@@ -74,9 +76,10 @@ func (o *TextOptions) headDimForLayer(layer int) int {
 type TextModel struct {
 	TokenEmbedding *nn.Embedding `gguf:"token_embd"`
 	*PerLayerProjector
-	Layers     []TextLayer `gguf:"blk"`
-	OutputNorm *nn.RMSNorm `gguf:"output_norm"`
-	Output     *nn.Linear  `gguf:"output,alt:token_embd"`
+	Layers      []TextLayer `gguf:"blk"`
+	OutputNorm  *nn.RMSNorm `gguf:"output_norm"`
+	Output      *nn.Linear  `gguf:"output,alt:token_embd"`
+	RopeFactors ml.Tensor   `gguf:"rope_freqs.weight"`
 	TextOptions
 }
 
@@ -165,6 +168,7 @@ func newTextModel(c fs.Config) *TextModel {
 }
 
 func (m *TextModel) Forward(ctx ml.Context, batch input.Batch, cache kvcache.Cache) ml.Tensor {
+	m.TextOptions.RopeFactors = m.RopeFactors
 	positions := ctx.Input().FromInts(batch.Positions, len(batch.Positions))
 
 	hiddenState := m.TokenEmbedding.Forward(ctx, batch.Inputs)
@@ -253,13 +257,12 @@ func (p *PerLayerProjector) Forward(ctx ml.Context, batch input.Batch, inputs ml
 }
 
 type TextSelfAttention struct {
-	Query       *nn.Linear  `gguf:"attn_q"`
-	QueryNorm   *nn.RMSNorm `gguf:"attn_q_norm"`
-	Key         *nn.Linear  `gguf:"attn_k"`
-	KeyNorm     *nn.RMSNorm `gguf:"attn_k_norm"`
-	Value       *nn.Linear  `gguf:"attn_v"`
-	Output      *nn.Linear  `gguf:"attn_output"`
-	RopeFactors ml.Tensor   `gguf:"rope_freqs.weight"` // proportional RoPE freq_factors
+	Query     *nn.Linear  `gguf:"attn_q"`
+	QueryNorm *nn.RMSNorm `gguf:"attn_q_norm"`
+	Key       *nn.Linear  `gguf:"attn_k"`
+	KeyNorm   *nn.RMSNorm `gguf:"attn_k_norm"`
+	Value     *nn.Linear  `gguf:"attn_v"`
+	Output    *nn.Linear  `gguf:"attn_output"`
 }
 
 func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, positions ml.Tensor, cache kvcache.Cache, sharedKV bool, opts *TextOptions) ml.Tensor {
@@ -291,8 +294,8 @@ func (sa *TextSelfAttention) Forward(ctx ml.Context, layer int, hiddenState, pos
 
 	// RoPE with proportional freq_factors on global layers
 	ropeOpts := []func(*rope.Options){rope.WithTypeNeoX()}
-	if sa.RopeFactors != nil && !opts.isLocal(layer) {
-		ropeOpts = append(ropeOpts, rope.WithFactors(sa.RopeFactors))
+	if opts.RopeFactors != nil && !opts.isLocal(layer) {
+		ropeOpts = append(ropeOpts, rope.WithFactors(opts.RopeFactors))
 	}
 	q = nn.RoPE(ctx, q, positions, ropeDims, ropeBase, 1.0, ropeOpts...)
 	if k != nil {
