@@ -425,6 +425,11 @@ func (s *Server) GenerateHandler(c *gin.Context) {
 
 	checkpointLoaded := time.Now()
 
+	// Clamp opts.NumCtx to the runner's actual loaded context length
+	if opts.NumCtx > r.ContextLength() {
+		opts.NumCtx = r.ContextLength()
+	}
+
 	// load the model
 	if req.Prompt == "" {
 		c.JSON(http.StatusOK, api.GenerateResponse{
