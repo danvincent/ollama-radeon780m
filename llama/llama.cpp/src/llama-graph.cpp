@@ -452,10 +452,11 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(!ubatch->equal_seqs()); // TODO: use ubatch->n_seqs instead of failing
 
     float * data = (float *) cross_kq_mask->data;
+    std::fill(data, data + ggml_nelements(cross_kq_mask), -INFINITY);
 
     for (int h = 0; h < 1; ++h) {
-        for (int i = 0; i < n_tokens; ++i) {
-            for (int j = 0; j < n_enc; ++j) {
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            for (int64_t j = 0; j < n_enc; ++j) {
                 float f = -INFINITY;
 
                 for (int s = 0; s < ubatch->n_seq_id[i]; ++s) {
@@ -467,12 +468,6 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
                 }
 
                 data[h*(n_enc*n_tokens) + i*n_enc + j] = f;
-            }
-        }
-
-        for (int i = n_tokens; i < n_tokens; ++i) {
-            for (int j = 0; j < n_enc; ++j) {
-                data[h*(n_enc*n_tokens) + i*n_enc + j] = -INFINITY;
             }
         }
     }
