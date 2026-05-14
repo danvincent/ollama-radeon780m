@@ -770,6 +770,10 @@ ggml_tensor * llm_graph_context::build_ffn(
    llm_ffn_gate_type   type_gate,
                  int   il) const {
     ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
+    if (up && (arch == LLM_ARCH_GEMMA4)) {
+        // Gemma4 has numerical issues with half-precision accumulators in FFN operations
+        ggml_mul_mat_set_prec(tmp, GGML_PREC_F32);
+    }
     cb(tmp, "ffn_up", il);
 
     if (up_b) {
@@ -787,11 +791,19 @@ ggml_tensor * llm_graph_context::build_ffn(
             case LLM_FFN_SEQ:
                 {
                     cur = build_lora_mm(gate, tmp);
+                    if (arch == LLM_ARCH_GEMMA4) {
+                        // Gemma4 has numerical issues with half-precision accumulators in FFN operations
+                        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+                    }
                     cb(cur, "ffn_gate", il);
                 } break;
             case LLM_FFN_PAR:
                 {
                     cur = build_lora_mm(gate, cur);
+                    if (arch == LLM_ARCH_GEMMA4) {
+                        // Gemma4 has numerical issues with half-precision accumulators in FFN operations
+                        ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+                    }
                     cb(cur, "ffn_gate", il);
                 } break;
         }
@@ -876,8 +888,8 @@ ggml_tensor * llm_graph_context::build_ffn(
 
     if (down) {
         cur = build_lora_mm(down, cur);
-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
-            // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
+        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_GEMMA4) {
+            // GLM4, GLM4_MOE, and GEMMA4 have numerical issues with half-precision accumulators
             ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
         }
     }
@@ -1092,6 +1104,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     ggml_tensor * up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+    // Gemma4 MoE expert weights should use F32 precision for numerical stability
+    if (arch == LLM_ARCH_GEMMA4) {
+        ggml_mul_mat_id_set_prec(up, GGML_PREC_F32);
+    }
     cb(up, "ffn_moe_up", il);
 
     if (up_exps_b) {
@@ -1102,6 +1118,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * experts = nullptr;
     if (gate_exps) {
         cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
+        // Gemma4 MoE expert weights should use F32 precision for numerical stability
+        if (arch == LLM_ARCH_GEMMA4) {
+            ggml_mul_mat_id_set_prec(cur, GGML_PREC_F32);
+        }
         cb(cur, "ffn_moe_gate", il);
     } else {
         cur = up;
@@ -1159,6 +1179,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
+    // Gemma4 MoE expert weights should use F32 precision for numerical stability
+    if (arch == LLM_ARCH_GEMMA4) {
+        ggml_mul_mat_id_set_prec(experts, GGML_PREC_F32);
+    }
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_b) {
@@ -1681,10 +1705,6 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
-            // GLM4 and GLM4_MOE seem to have numerical issues with half-precision accumulators
-            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
-        }
     }
 
     if (wo_b) {
@@ -1748,6 +1768,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (wo) {
         cur = build_lora_mm(wo, cur);
+        // Gemma4 (which uses ISWA) has numerical issues with half-precision accumulators in attention output projection
+        if (arch == LLM_ARCH_GEMMA4) {
+            ggml_mul_mat_set_prec(cur, GGML_PREC_F32);
+        }
     }
 
     if (wo_b) {
