@@ -1902,3 +1902,251 @@ func TestCompleteWriter_StreamFlushesAfterEachChunk(t *testing.T) {
 		t.Errorf("expected at least 3 flushes, got %d", flusher.flushCount)
 	}
 }
+
+// TestChatWriter_StreamPreservesExactSSEFormatting tests that chat streaming preserves exact SSE formatting
+// This is a regression test to ensure the SSE frame format remains consistent after optimizations
+func TestChatWriter_StreamPreservesExactSSEFormatting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writer := &ChatWriter{
+		stream:     true,
+		id:         "chatcmpl-test",
+		BaseWriter: BaseWriter{ResponseWriter: context.Writer},
+	}
+
+	response := api.ChatResponse{
+		Model: "test-model",
+		Message: api.Message{
+			Content: "Hello world",
+		},
+		Done: true,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	body := recorder.Body.String()
+
+	// Verify that SSE frames are properly delimited with "\n\n"
+	if !strings.Contains(body, "\n\n") {
+		t.Fatalf("expected SSE frames to be delimited with \\n\\n, got:\n%s", body)
+	}
+
+	// Verify that all frames (except possibly the last) end with "\n\n"
+	frames := strings.Split(body, "\n\n")
+	for i, frame := range frames {
+		if i == len(frames)-1 && frame == "" {
+			// Last empty frame is expected
+			continue
+		}
+		if frame == "" {
+			continue
+		}
+		if !strings.HasPrefix(frame, "data: ") {
+			t.Errorf("frame %d does not start with 'data: ': %q", i, frame)
+		}
+	}
+
+	// Verify that [DONE] frame is properly formatted
+	if !strings.Contains(body, "data: [DONE]\n\n") {
+		t.Fatalf("expected '[DONE]' frame with proper SSE formatting, got:\n%s", body)
+	}
+
+	// Parse the SSE frames and verify they are valid JSON (except [DONE])
+	frames = sseDataFrames(body)
+	for i, frame := range frames {
+		if frame == "[DONE]" {
+			continue
+		}
+		var chunk openai.ChatCompletionChunk
+		if err := json.Unmarshal([]byte(frame), &chunk); err != nil {
+			t.Fatalf("frame %d is not valid JSON: %v\nframe: %q", i, err, frame)
+		}
+	}
+}
+
+// TestChatWriter_StreamWithUsagePreservesExactSSEFormatting tests SSE formatting with usage tracking
+func TestChatWriter_StreamWithUsagePreservesExactSSEFormatting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writer := &ChatWriter{
+		stream:        true,
+		streamOptions: &openai.StreamOptions{IncludeUsage: true},
+		id:            "chatcmpl-test",
+		BaseWriter:    BaseWriter{ResponseWriter: context.Writer},
+	}
+
+	response := api.ChatResponse{
+		Model: "test-model",
+		Message: api.Message{
+			Content: "Hello",
+		},
+		Done: true,
+		Metrics: api.Metrics{
+			PromptEvalCount: 10,
+			EvalCount:       5,
+		},
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	body := recorder.Body.String()
+	frames := sseDataFrames(body)
+
+	// Should have: content chunk + usage chunk + [DONE]
+	if len(frames) < 3 {
+		t.Fatalf("expected at least 3 frames (content, usage, [DONE]), got %d:\n%s", len(frames), body)
+	}
+
+	// Last frame should be [DONE]
+	if frames[len(frames)-1] != "[DONE]" {
+		t.Fatalf("expected last frame to be [DONE], got %q", frames[len(frames)-1])
+	}
+
+	// Verify all frames (except [DONE]) are valid JSON
+	for i, frame := range frames {
+		if frame == "[DONE]" {
+			continue
+		}
+		var chunk openai.ChatCompletionChunk
+		if err := json.Unmarshal([]byte(frame), &chunk); err != nil {
+			t.Fatalf("frame %d is not valid JSON: %v\nframe: %q", i, err, frame)
+		}
+	}
+
+	// Verify [DONE] has exact format
+	if !strings.Contains(body, "data: [DONE]\n\n") {
+		t.Fatalf("expected '[DONE]' with exact format 'data: [DONE]\\n\\n', got:\n%s", body)
+	}
+}
+
+// TestCompleteWriter_StreamPreservesExactSSEFormatting tests that completion streaming preserves exact SSE formatting
+func TestCompleteWriter_StreamPreservesExactSSEFormatting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writer := &CompleteWriter{
+		stream:     true,
+		id:         "cmpl-test",
+		BaseWriter: BaseWriter{ResponseWriter: context.Writer},
+	}
+
+	response := api.GenerateResponse{
+		Model:    "test-model",
+		Response: "Hello world",
+		Done:     true,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	body := recorder.Body.String()
+
+	// Verify that SSE frames are properly delimited with "\n\n"
+	if !strings.Contains(body, "\n\n") {
+		t.Fatalf("expected SSE frames to be delimited with \\n\\n, got:\n%s", body)
+	}
+
+	// Verify that [DONE] frame is properly formatted
+	if !strings.Contains(body, "data: [DONE]\n\n") {
+		t.Fatalf("expected '[DONE]' frame with proper SSE formatting, got:\n%s", body)
+	}
+
+	// Parse the SSE frames and verify they are valid JSON (except [DONE])
+	frames := sseDataFrames(body)
+	for i, frame := range frames {
+		if frame == "[DONE]" {
+			continue
+		}
+		var chunk openai.CompletionChunk
+		if err := json.Unmarshal([]byte(frame), &chunk); err != nil {
+			t.Fatalf("frame %d is not valid JSON: %v\nframe: %q", i, err, frame)
+		}
+	}
+}
+
+// TestCompleteWriter_StreamWithUsagePreservesExactSSEFormatting tests completion SSE formatting with usage tracking
+func TestCompleteWriter_StreamWithUsagePreservesExactSSEFormatting(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writer := &CompleteWriter{
+		stream:        true,
+		streamOptions: &openai.StreamOptions{IncludeUsage: true},
+		id:            "cmpl-test",
+		BaseWriter:    BaseWriter{ResponseWriter: context.Writer},
+	}
+
+	response := api.GenerateResponse{
+		Model:    "test-model",
+		Response: "Hello",
+		Done:     true,
+		Metrics: api.Metrics{
+			PromptEvalCount: 10,
+			EvalCount:       5,
+		},
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	body := recorder.Body.String()
+	frames := sseDataFrames(body)
+
+	// Should have: content chunk + usage chunk + [DONE]
+	if len(frames) < 3 {
+		t.Fatalf("expected at least 3 frames (content, usage, [DONE]), got %d:\n%s", len(frames), body)
+	}
+
+	// Last frame should be [DONE]
+	if frames[len(frames)-1] != "[DONE]" {
+		t.Fatalf("expected last frame to be [DONE], got %q", frames[len(frames)-1])
+	}
+
+	// Verify all frames (except [DONE]) are valid JSON
+	for i, frame := range frames {
+		if frame == "[DONE]" {
+			continue
+		}
+		var chunk openai.CompletionChunk
+		if err := json.Unmarshal([]byte(frame), &chunk); err != nil {
+			t.Fatalf("frame %d is not valid JSON: %v\nframe: %q", i, err, frame)
+		}
+	}
+
+	// Verify [DONE] has exact format
+	if !strings.Contains(body, "data: [DONE]\n\n") {
+		t.Fatalf("expected '[DONE]' with exact format 'data: [DONE]\\n\\n', got:\n%s", body)
+	}
+}

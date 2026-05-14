@@ -57,7 +57,7 @@ systemctl stop ollama || true
 
 # Step 5: Remove apt package
 print_info "Removing apt-installed ollama package..."
-apt remove --purge -y ollama || true
+dnf remove --purge -y ollama || true
 
 # Step 6: Remove old binaries
 print_info "Removing old ollama binaries..."

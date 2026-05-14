@@ -94,7 +94,16 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 			if !w.toolCallSent && len(c.Choices) > 0 && len(c.Choices[0].Delta.ToolCalls) > 0 {
 				w.toolCallSent = true
 			}
-			_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+			// Write SSE frame with lower allocation: direct writes instead of fmt.Sprintf
+			_, err = w.ResponseWriter.Write([]byte("data: "))
+			if err != nil {
+				return 0, err
+			}
+			_, err = w.ResponseWriter.Write(d)
+			if err != nil {
+				return 0, err
+			}
+			_, err = w.ResponseWriter.Write([]byte("\n\n"))
 			if err != nil {
 				return 0, err
 			}
@@ -119,7 +128,16 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 				if err != nil {
 					return 0, err
 				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+				// Write SSE frame with lower allocation: direct writes instead of fmt.Sprintf
+				_, err = w.ResponseWriter.Write([]byte("data: "))
+				if err != nil {
+					return 0, err
+				}
+				_, err = w.ResponseWriter.Write(d)
+				if err != nil {
+					return 0, err
+				}
+				_, err = w.ResponseWriter.Write([]byte("\n\n"))
 				if err != nil {
 					return 0, err
 				}
@@ -183,7 +201,16 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 			return 0, err
 		}
 
-		_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+		// Write SSE frame with lower allocation: direct writes instead of fmt.Sprintf
+		_, err = w.ResponseWriter.Write([]byte("data: "))
+		if err != nil {
+			return 0, err
+		}
+		_, err = w.ResponseWriter.Write(d)
+		if err != nil {
+			return 0, err
+		}
+		_, err = w.ResponseWriter.Write([]byte("\n\n"))
 		if err != nil {
 			return 0, err
 		}
@@ -201,7 +228,16 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 				if err != nil {
 					return 0, err
 				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+				// Write SSE frame with lower allocation: direct writes instead of fmt.Sprintf
+				_, err = w.ResponseWriter.Write([]byte("data: "))
+				if err != nil {
+					return 0, err
+				}
+				_, err = w.ResponseWriter.Write(d)
+				if err != nil {
+					return 0, err
+				}
+				_, err = w.ResponseWriter.Write([]byte("\n\n"))
 				if err != nil {
 					return 0, err
 				}
@@ -494,7 +530,24 @@ func (w *ResponsesWriter) writeEvent(eventType string, data any) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, d)))
+	// Write event frame with lower allocation: direct writes instead of fmt.Sprintf
+	_, err = w.ResponseWriter.Write([]byte("event: "))
+	if err != nil {
+		return err
+	}
+	_, err = w.ResponseWriter.Write([]byte(eventType))
+	if err != nil {
+		return err
+	}
+	_, err = w.ResponseWriter.Write([]byte("\ndata: "))
+	if err != nil {
+		return err
+	}
+	_, err = w.ResponseWriter.Write(d)
+	if err != nil {
+		return err
+	}
+	_, err = w.ResponseWriter.Write([]byte("\n\n"))
 	if err != nil {
 		return err
 	}
