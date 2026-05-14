@@ -1631,3 +1631,274 @@ func TestResponsesMiddlewareZstd(t *testing.T) {
 		})
 	}
 }
+
+// MockFlusher wraps a ResponseWriter and tracks whether Flush() was called
+type MockFlusher struct {
+	gin.ResponseWriter
+	flushCount int
+}
+
+func (m *MockFlusher) Flush() {
+	m.flushCount++
+	if f, ok := m.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// TestChatMiddleware_StreamingResponseHeaders tests that anti-buffering headers are set for streaming responses
+func TestChatMiddleware_StreamingResponseHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writer := &ChatWriter{
+		stream:        true,
+		streamOptions: nil,
+		id:            "chatcmpl-test",
+		BaseWriter:    BaseWriter{ResponseWriter: context.Writer},
+	}
+
+	response := api.ChatResponse{
+		Model: "test-model",
+		Message: api.Message{
+			Content: "Hello",
+		},
+		Done: true,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	// Check for anti-buffering headers
+	if got := recorder.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("expected Content-Type text/event-stream, got %q", got)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("expected Cache-Control: no-cache, got %q", got)
+	}
+	if got := recorder.Header().Get("Connection"); got != "keep-alive" {
+		t.Errorf("expected Connection: keep-alive, got %q", got)
+	}
+	if got := recorder.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("expected X-Accel-Buffering: no, got %q", got)
+	}
+}
+
+// TestChatMiddleware_NonStreamingNoAntiBufferHeaders tests that anti-buffering headers are NOT set for non-streaming responses
+func TestChatMiddleware_NonStreamingNoAntiBufferHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writer := &ChatWriter{
+		stream:        false,
+		streamOptions: nil,
+		id:            "chatcmpl-test",
+		BaseWriter:    BaseWriter{ResponseWriter: context.Writer},
+	}
+
+	response := api.ChatResponse{
+		Model: "test-model",
+		Message: api.Message{
+			Content: "Hello",
+		},
+		Done: true,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	// Check that anti-buffering headers are NOT set
+	if got := recorder.Header().Get("Cache-Control"); got != "" {
+		t.Errorf("expected no Cache-Control header, got %q", got)
+	}
+	if got := recorder.Header().Get("Connection"); got != "" {
+		t.Errorf("expected no Connection header, got %q", got)
+	}
+	if got := recorder.Header().Get("X-Accel-Buffering"); got != "" {
+		t.Errorf("expected no X-Accel-Buffering header, got %q", got)
+	}
+}
+
+// TestChatWriter_StreamFlushesAfterEachChunk tests that chat streaming flushes after each SSE event
+func TestChatWriter_StreamFlushesAfterEachChunk(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	flusher := &MockFlusher{ResponseWriter: context.Writer, flushCount: 0}
+
+	writer := &ChatWriter{
+		stream:        true,
+		streamOptions: &openai.StreamOptions{IncludeUsage: true},
+		id:            "chatcmpl-test",
+		BaseWriter:    BaseWriter{ResponseWriter: flusher},
+	}
+
+	response := api.ChatResponse{
+		Model: "test-model",
+		Message: api.Message{
+			Content: "Hello",
+		},
+		Done: true,
+		Metrics: api.Metrics{
+			PromptEvalCount: 5,
+			EvalCount:       10,
+		},
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	// With streaming + IncludeUsage + [DONE], we expect at least 3 flushes:
+	// 1. After the content chunk
+	// 2. After the usage chunk
+	// 3. After the [DONE] frame
+	if flusher.flushCount < 3 {
+		t.Errorf("expected at least 3 flushes, got %d", flusher.flushCount)
+	}
+}
+
+// TestCompletionsMiddleware_StreamingResponseHeaders tests that anti-buffering headers are set for completions streaming
+func TestCompletionsMiddleware_StreamingResponseHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writer := &CompleteWriter{
+		stream:        true,
+		streamOptions: nil,
+		id:            "cmpl-test",
+		BaseWriter:    BaseWriter{ResponseWriter: context.Writer},
+	}
+
+	response := api.GenerateResponse{
+		Model:    "test-model",
+		Response: "Hello",
+		Done:     true,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	// Check for anti-buffering headers
+	if got := recorder.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("expected Content-Type text/event-stream, got %q", got)
+	}
+	if got := recorder.Header().Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("expected Cache-Control: no-cache, got %q", got)
+	}
+	if got := recorder.Header().Get("Connection"); got != "keep-alive" {
+		t.Errorf("expected Connection: keep-alive, got %q", got)
+	}
+	if got := recorder.Header().Get("X-Accel-Buffering"); got != "no" {
+		t.Errorf("expected X-Accel-Buffering: no, got %q", got)
+	}
+}
+
+// TestCompletionsMiddleware_NonStreamingNoAntiBufferHeaders tests that anti-buffering headers are NOT set for non-streaming completions
+func TestCompletionsMiddleware_NonStreamingNoAntiBufferHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	writer := &CompleteWriter{
+		stream:        false,
+		streamOptions: nil,
+		id:            "cmpl-test",
+		BaseWriter:    BaseWriter{ResponseWriter: context.Writer},
+	}
+
+	response := api.GenerateResponse{
+		Model:    "test-model",
+		Response: "Hello",
+		Done:     true,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	// Check that anti-buffering headers are NOT set
+	if got := recorder.Header().Get("Cache-Control"); got != "" {
+		t.Errorf("expected no Cache-Control header, got %q", got)
+	}
+	if got := recorder.Header().Get("Connection"); got != "" {
+		t.Errorf("expected no Connection header, got %q", got)
+	}
+	if got := recorder.Header().Get("X-Accel-Buffering"); got != "" {
+		t.Errorf("expected no X-Accel-Buffering header, got %q", got)
+	}
+}
+
+// TestCompleteWriter_StreamFlushesAfterEachChunk tests that completions streaming flushes after each SSE event
+func TestCompleteWriter_StreamFlushesAfterEachChunk(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+
+	flusher := &MockFlusher{ResponseWriter: context.Writer, flushCount: 0}
+
+	writer := &CompleteWriter{
+		stream:        true,
+		streamOptions: &openai.StreamOptions{IncludeUsage: true},
+		id:            "cmpl-test",
+		BaseWriter:    BaseWriter{ResponseWriter: flusher},
+	}
+
+	response := api.GenerateResponse{
+		Model:    "test-model",
+		Response: "Hello",
+		Done:     true,
+		Metrics: api.Metrics{
+			PromptEvalCount: 5,
+			EvalCount:       10,
+		},
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("marshal response: %v", err)
+	}
+
+	if _, err = writer.Write(data); err != nil {
+		t.Fatalf("write response: %v", err)
+	}
+
+	// With streaming + IncludeUsage + [DONE], we expect at least 3 flushes:
+	// 1. After the content chunk
+	// 2. After the usage chunk
+	// 3. After the [DONE] frame
+	if flusher.flushCount < 3 {
+		t.Errorf("expected at least 3 flushes, got %d", flusher.flushCount)
+	}
+}
