@@ -2380,6 +2380,11 @@ func (s *Server) ChatHandler(c *gin.Context) {
 
 	checkpointLoaded := time.Now()
 
+	// Clamp opts.NumCtx to the runner's actual loaded context length
+	if opts.NumCtx > r.ContextLength() {
+		opts.NumCtx = r.ContextLength()
+	}
+
 	if len(req.Messages) == 0 {
 		c.JSON(http.StatusOK, api.ChatResponse{
 			Model:      req.Model,

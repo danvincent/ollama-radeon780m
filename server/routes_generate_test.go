@@ -54,6 +54,7 @@ type mockRunner struct {
 	llm.CompletionRequest
 	llm.CompletionResponse
 	CompletionFn func(context.Context, llm.CompletionRequest, func(llm.CompletionResponse)) error
+	contextLength int
 }
 
 func (m *mockRunner) Completion(ctx context.Context, r llm.CompletionRequest, fn func(r llm.CompletionResponse)) error {
@@ -74,6 +75,13 @@ func (mockRunner) Tokenize(_ context.Context, s string) (tokens []int, err error
 }
 
 func (mockRunner) Ping(_ context.Context) error { return nil }
+
+func (m *mockRunner) ContextLength() int {
+	if m.contextLength > 0 {
+		return m.contextLength
+	}
+	return 2048 // default
+}
 
 func newMockServer(mock *mockRunner) func(ml.SystemInfo, []ml.DeviceInfo, string, *ggml.GGML, []string, []string, api.Options, int) (llm.LlamaServer, error) {
 	return func(_ ml.SystemInfo, _ []ml.DeviceInfo, _ string, _ *ggml.GGML, _, _ []string, _ api.Options, _ int) (llm.LlamaServer, error) {
@@ -2686,5 +2694,206 @@ func TestImageGenerateStreamFalse(t *testing.T) {
 
 	if !resp.Done {
 		t.Errorf("expected done=true")
+	}
+}
+
+func TestChatHandlerClampsNumCtxToRunnerContextLength(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	gin.SetMode(gin.TestMode)
+
+	mock := mockRunner{
+		contextLength: 2048, // Runner only supports 2048
+		CompletionResponse: llm.CompletionResponse{
+			Done:               true,
+			DoneReason:         llm.DoneReasonStop,
+			PromptEvalCount:    1,
+			PromptEvalDuration: 1,
+			EvalCount:          1,
+			EvalDuration:       1,
+		},
+	}
+
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 1),
+			finishedReqCh:   make(chan *LlmRequest, 1),
+			expiredCh:       make(chan *runnerRef, 1),
+			unloadedCh:      make(chan any, 1),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(&mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				// add small delay to simulate loading
+				time.Sleep(time.Millisecond)
+				req.successCh <- &runnerRef{
+					llama: &mock,
+				}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(8192),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model: "test",
+		Files: map[string]string{"file.gguf": digest},
+		Template: `{{- range .Messages }}
+{{- .Role }}: {{ .Content }}
+{{ end }}`,
+		Stream: &stream,
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	// Request with NumCtx larger than what the runner actually supports
+	w = createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model: "test",
+		Messages: []api.Message{
+			{Role: "user", Content: "Hello!"},
+		},
+		Options: map[string]any{
+			"num_ctx": 4096, // Requesting 4096, but runner only supports 2048
+		},
+		Stream: &stream,
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// The key verification: CompletionRequest.Options.NumCtx should be clamped to the runner's actual context length
+	if mock.CompletionRequest.Options.NumCtx != 2048 {
+		t.Errorf("expected CompletionRequest.Options.NumCtx clamped to 2048, got %d", mock.CompletionRequest.Options.NumCtx)
+	}
+}
+
+// TestChatHandlerPreservesNumCtxWhenWithinLimit is a no-regression test verifying that
+// when requested num_ctx is within the runner's supported range, the value is preserved unchanged.
+func TestChatHandlerPreservesNumCtxWhenWithinLimit(t *testing.T) {
+	t.Setenv("OLLAMA_CONTEXT_LENGTH", "4096")
+	gin.SetMode(gin.TestMode)
+
+	mock := mockRunner{
+		contextLength: 4096, // Runner supports 4096
+		CompletionResponse: llm.CompletionResponse{
+			Done:               true,
+			DoneReason:         llm.DoneReasonStop,
+			PromptEvalCount:    1,
+			PromptEvalDuration: 1,
+			EvalCount:          1,
+			EvalDuration:       1,
+		},
+	}
+
+	s := Server{
+		sched: &Scheduler{
+			pendingReqCh:    make(chan *LlmRequest, 1),
+			finishedReqCh:   make(chan *LlmRequest, 1),
+			expiredCh:       make(chan *runnerRef, 1),
+			unloadedCh:      make(chan any, 1),
+			loaded:          make(map[string]*runnerRef),
+			newServerFn:     newMockServer(&mock),
+			getGpuFn:        getGpuFn,
+			getSystemInfoFn: getSystemInfoFn,
+			waitForRecovery: 250 * time.Millisecond,
+			loadFn: func(req *LlmRequest, _ ml.SystemInfo, _ []ml.DeviceInfo, _ bool) bool {
+				// add small delay to simulate loading
+				time.Sleep(time.Millisecond)
+				req.successCh <- &runnerRef{
+					llama: &mock,
+				}
+				return false
+			},
+		},
+	}
+
+	go s.sched.Run(t.Context())
+
+	_, digest := createBinFile(t, ggml.KV{
+		"general.architecture":          "llama",
+		"llama.block_count":             uint32(1),
+		"llama.context_length":          uint32(8192),
+		"llama.embedding_length":        uint32(4096),
+		"llama.attention.head_count":    uint32(32),
+		"llama.attention.head_count_kv": uint32(8),
+		"tokenizer.ggml.tokens":         []string{""},
+		"tokenizer.ggml.scores":         []float32{0},
+		"tokenizer.ggml.token_type":     []int32{0},
+	}, []*ggml.Tensor{
+		{Name: "token_embd.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_down.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_gate.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_up.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.ffn_norm.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_k.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_q.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "blk.0.attn_v.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+		{Name: "output.weight", Shape: []uint64{1}, WriterTo: bytes.NewReader(make([]byte, 4))},
+	})
+
+	w := createRequest(t, s.CreateHandler, api.CreateRequest{
+		Model: "test",
+		Files: map[string]string{"file.gguf": digest},
+		Template: `{{- range .Messages }}
+{{- .Role }}: {{ .Content }}
+{{ end }}`,
+		Stream: &stream,
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	// Request with NumCtx within the runner's supported range
+	requestedNumCtx := 2048
+	w = createRequest(t, s.ChatHandler, api.ChatRequest{
+		Model: "test",
+		Messages: []api.Message{
+			{Role: "user", Content: "Hello!"},
+		},
+		Options: map[string]any{
+			"num_ctx": requestedNumCtx, // Requesting 2048, runner supports 4096
+		},
+		Stream: &stream,
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verification: CompletionRequest.Options.NumCtx should be preserved unchanged
+	if mock.CompletionRequest.Options.NumCtx != requestedNumCtx {
+		t.Errorf("expected CompletionRequest.Options.NumCtx preserved at %d, got %d", requestedNumCtx, mock.CompletionRequest.Options.NumCtx)
 	}
 }
