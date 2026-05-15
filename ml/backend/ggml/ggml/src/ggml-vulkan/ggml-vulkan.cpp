@@ -5644,8 +5644,10 @@ static vk_matmul_pipeline ggml_vk_get_mul_mat_mat_id_pipeline(ggml_backend_vk_co
     }
 
     vk_matmul_pipeline2& mmp = ctx->device->pipeline_dequant_mul_mat_mat_id[src0_type];
-    // XXX TODO 'prec' is not actually allowed in mul_mat_id.
-    bool prefer_fp16acc = ctx->device->fp16 /*&& prec == GGML_PREC_DEFAULT*/;
+    // Apply precision control to quantized mul_mat_id, following native path logic:
+    // - prec == GGML_PREC_DEFAULT: prefer f16acc if available
+    // - prec != GGML_PREC_DEFAULT (e.g., GGML_PREC_F32): use f32acc for better precision
+    bool prefer_fp16acc = prec == GGML_PREC_DEFAULT && ctx->device->fp16;
     bool support_fp16acc = !mmp.f16acc->is_empty();
     bool support_fp32acc = !mmp.f32acc->is_empty();
 
@@ -7683,12 +7685,16 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     uint32_t stride_batch_x = ne00*ne01;
     uint32_t stride_batch_y = ne10*ne11;
 
-    if (!ggml_vk_dim01_contiguous(src0) && !qx_needs_dequant) {
-        stride_batch_x = src0->nb[0] / ggml_type_size(src0->type);
+    // When not dequanting, use actual nb[2] stride which correctly handles
+    // non-contiguous tensors (e.g., fused views in Gemma4). This computation
+    // is mathematically equivalent to the default for contiguous tensors:
+    // nb[2]/type_size = (ne00*ne01*type_size)/type_size = ne00*ne01
+    if (!qx_needs_dequant) {
+        stride_batch_x = src0->nb[2] / ggml_type_size(src0->type);
     }
 
-    if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant && !quantize_y) {
-        stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
+    if (!qy_needs_dequant && !quantize_y) {
+        stride_batch_y = src1->nb[2] / ggml_type_size(src1->type);
     }
 
     // compute
@@ -7871,10 +7877,19 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
         }
     }
 
+    uint32_t stride_batch_x = ne00*ne01;
     uint32_t stride_batch_y = ne10*ne11;
 
-    if (!ggml_vk_dim01_contiguous(src1) && !qy_needs_dequant) {
-        stride_batch_y = src1->nb[0] / ggml_type_size(src1->type);
+    // When not dequanting, use actual nb[2] stride which correctly handles
+    // non-contiguous tensors (e.g., fused views in Gemma4). This computation
+    // is mathematically equivalent to the default for contiguous tensors:
+    // nb[2]/type_size = (ne00*ne01*type_size)/type_size = ne00*ne01
+    if (!qx_needs_dequant) {
+        stride_batch_x = src0->nb[2] / ggml_type_size(src0->type);
+    }
+
+    if (!qy_needs_dequant && !quantize_y) {
+        stride_batch_y = src1->nb[2] / ggml_type_size(src1->type);
     }
 
     const uint32_t max_groups_x = ctx->device->properties.limits.maxComputeWorkGroupCount[0];
@@ -7913,7 +7928,7 @@ static void ggml_vk_mul_mat_vec_id_q_f16(ggml_backend_vk_context * ctx, vk_conte
     // compute
     const vk_mat_vec_id_push_constants pc = {
         (uint32_t)ne00, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne01,
-        (uint32_t)(ne00 * ne01), stride_batch_y, (uint32_t)(ne20 * ne21),
+        stride_batch_x, stride_batch_y, (uint32_t)(ne20 * ne21),
         fusion_flags,
         (uint32_t)nei0, (uint32_t)ne11,
     };
@@ -14811,6 +14826,9 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_mul_mat(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL_MAT_ID) {
             tensor_clone = ggml_mul_mat_id(ggml_ctx, src_clone[0], src_clone[1], src_clone[2]);
+            // Preserve the precision parameter from the original tensor
+            const enum ggml_prec prec = (enum ggml_prec) ggml_get_op_params_i32(tensor, 0);
+            ggml_mul_mat_id_set_prec(tensor_clone, prec);
         } else if (tensor->op == GGML_OP_SUB) {
             tensor_clone = ggml_sub(ggml_ctx, src_clone[0], src_clone[1]);
         } else if (tensor->op == GGML_OP_MUL) {

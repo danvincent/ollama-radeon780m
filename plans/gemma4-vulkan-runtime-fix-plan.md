@@ -1,46 +1,44 @@
 ## Plan: Gemma4 Vulkan Runtime Fix
 
-Fix the false-positive GPU validation path first, then diagnose and repair the real Gemma4 Vulkan runtime failure so deployment claims match actual UM790 behavior. The work should tighten validation, fix the runtime path causing CPU fallback or empty output, and finish with end-to-end deployment verification.
+We now have a real failing runtime case on Gemma4 8B Q4_K_M with Vulkan active, so the next pass is optimized for the fastest likely correctness fix rather than broad cleanup. We will fix the most likely remaining Gemma4 prefill precision gap first, validate against the live failing prompt set starting with the 50 states prompt, then commit that baseline and continue improving if further issues remain.
 
 **Phases**
-1. **Phase 1: Make Validation Truthful**
-    - **Objective:** Remove false GPU success signals and make the scripts fail on CPU fallback or empty output.
-    - **Files/Functions to Modify/Create:** deployment/validation scripts related to the local build and Phase 5 validation, including likely `scripts/build_deploy_local.sh` and any repo validation helpers used to detect GPU state.
-    - **Tests to Write:** checks for CPU fallback detection, empty-response failure detection, misleading generic `GPU`/`offload` grep matches, and required success log matching.
+1. **Phase 1: Fix Gemma4 FFN prefill precision first**
+    - **Objective:** Eliminate the most likely remaining live-runtime corruption source by forcing F32 on the missing Gemma4 build_ffn() up and gate projections during prefill.
+    - **Files/Functions to Modify/Create:** llama/llama.cpp/src/llama-graph.cpp, especially build_ffn(...), plus targeted Gemma4 precision tests in llama/ or llm/ as appropriate.
+    - **Tests to Write:** failing tests for Gemma4 FFN precision on up, gate, and down outputs in the real graph-builder path.
     - **Steps:**
-        1. Write tests first for the known false-positive cases: `0/36 layers`, empty output, and generic `GPU` text that does not prove acceleration.
-        2. Update validation to require real success signals instead of permissive grep matches.
-        3. Run targeted tests, then broader relevant test coverage, and confirm the validation path fails correctly on CPU-only or empty-output runs.
+        1. Add failing tests that prove Gemma4 build_ffn() still leaves up and gate on default precision.
+        2. Patch build_ffn() so Gemma4 sets F32 on all required FFN projections.
+        3. Re-run targeted tests and the affected suites until passing.
 
-2. **Phase 2: Diagnose and Fix Runtime Fallback**
-    - **Objective:** Identify why the deployed Phase 3 build still lands on CPU fallback and sometimes returns no response, then implement the minimal runtime fix.
-    - **Files/Functions to Modify/Create:** likely `llm/server.go`, related load/layout/runtime surfaces, and any deployment/runtime logging helpers implicated by the investigation.
-    - **Tests to Write:** regression tests for the confirmed failing runtime branch and no-response behavior.
+2. **Phase 2: Prove Vulkan output correctness on the live failing case and commit baseline**
+    - **Objective:** Use the exact failing runtime scenario to verify whether the FFN fix resolves the wrong-answer behavior on Vulkan, then establish a committed baseline if it does.
+    - **Files/Functions to Modify/Create:** no production files unless runtime validation reveals another directly related defect; tests/log capture support as needed.
+    - **Tests to Write:** runtime-focused validation for Gemma4 8B Q4_K_M on Vulkan versus CPU quality, starting with the 50 states prompt and then expanding to a small deeper prompt set if the initial prompt is fixed.
     - **Steps:**
-        1. Reproduce the failing runtime path using the deployed service behavior and logs.
-        2. Add failing tests for the confirmed branch or behavior before changing production code.
-        3. Implement the minimal code change, rerun targeted tests, and then rerun broader relevant coverage.
+        1. Run targeted tests first, then the relevant broader suites.
+        2. Re-run OLLAMA_VULKAN=1 OLLAMA_DEBUG=1 ./ollama run gemma4 with the failing prompt and compare to CPU-only output.
+        3. If fixed, provide a commit message for the baseline and continue to the next phase.
 
-3. **Phase 3: Harden Deployment Verification**
-    - **Objective:** Ensure deployment claims match the actual running service and model behavior.
-    - **Files/Functions to Modify/Create:** deployment scripts, validation scripts, and any status/reporting surfaces that claim GPU usage.
-    - **Tests to Write:** checks that deployment validation rejects stale, misconfigured, or CPU-only service states.
+3. **Phase 3: Add Gemma4 attention-side F32 only if Phase 2 still fails or further improvement is needed**
+    - **Objective:** If Vulkan output is still corrupted, or if post-baseline improvement is needed, extend Gemma4-specific F32 handling to the remaining likely attention projections used during prefill.
+    - **Files/Functions to Modify/Create:** likely llama/llama.cpp/src/models/gemma4.cpp and llama/llama.cpp/src/llama-graph.cpp, especially build_attn(...).
+    - **Tests to Write:** failing tests for Gemma4 attention projection precision in the actual path used by Gemma4 8B.
     - **Steps:**
-        1. Write tests for stale binary and misconfigured service scenarios.
-        2. Add checks for live service configuration and post-load runtime state.
-        3. Re-run deployment validation flow and confirm it fails fast on invalid states.
+        1. Add failing tests for missing attention-side precision enforcement.
+        2. Implement the smallest Gemma4-specific fix in the actual attention path.
+        3. Re-run targeted suites and the live Vulkan runtime checks.
 
-4. **Phase 4: Verify End-to-End on UM790**
-    - **Objective:** Prove the final build is ready by validating real prompts and real runtime state.
-    - **Files/Functions to Modify/Create:** minimal documentation or reporting updates only if needed.
-    - **Tests to Write:** only gap-filling regression tests if Phase 4 reveals a missing automated check.
+4. **Phase 4: Final regression and closeout**
+    - **Objective:** Lock in the runtime fix with regression coverage representing the real failure class: Vulkan active, coherent output required.
+    - **Files/Functions to Modify/Create:** final touched test files across llama, ml/backend/ggml, and llm as needed.
+    - **Tests to Write:** regression coverage for the live wrong-answer Vulkan case as closely as the repository can support.
     - **Steps:**
-        1. Re-deploy the fixed build.
-        2. Validate `What is the capital of Iceland?` and `list the states of America` using the hardened validation path.
-        3. Confirm actual GPU versus CPU state from reliable runtime signals only.
-        4. Record completion details for the full plan.
+        1. Tighten tests around the final identified defect or defects.
+        2. Run targeted suites and broader affected suites.
+        3. Confirm Vulkan now produces correct output for the original failing case and deeper prompt set.
 
 **Open Questions**
-1. Is the no-response failure caused by the same runtime path as the CPU fallback, or a second issue after load?
-2. Should final validation require `ollama ps` or API VRAM evidence in addition to log evidence?
-3. Is the current deployed service definitely using the intended Vulkan environment on every restart?
+1. Resolved: start with the 50 states prompt, then expand to a deeper prompt set after the first live fix works.
+2. Resolved: commit the initial successful live fix as a baseline, then continue improving.

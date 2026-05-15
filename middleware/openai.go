@@ -80,8 +80,12 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 
 	// chat chunk
 	if w.stream {
-		chunks := openai.ToChunks(w.id, chatResponse, w.toolCallSent)
 		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+		w.ResponseWriter.Header().Set("Cache-Control", "no-cache")
+		w.ResponseWriter.Header().Set("Connection", "keep-alive")
+		w.ResponseWriter.Header().Set("X-Accel-Buffering", "no")
+
+		chunks := openai.ToChunks(w.id, chatResponse, w.toolCallSent)
 		for _, c := range chunks {
 			d, err := json.Marshal(c)
 			if err != nil {
@@ -90,9 +94,22 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 			if !w.toolCallSent && len(c.Choices) > 0 && len(c.Choices[0].Delta.ToolCalls) > 0 {
 				w.toolCallSent = true
 			}
-			_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+			// Write SSE frame with lower allocation: direct writes instead of fmt.Sprintf
+			_, err = w.ResponseWriter.Write([]byte("data: "))
 			if err != nil {
 				return 0, err
+			}
+			_, err = w.ResponseWriter.Write(d)
+			if err != nil {
+				return 0, err
+			}
+			_, err = w.ResponseWriter.Write([]byte("\n\n"))
+			if err != nil {
+				return 0, err
+			}
+			// Flush after each chunk
+			if f, ok := w.ResponseWriter.(http.Flusher); ok {
+				f.Flush()
 			}
 		}
 
@@ -111,14 +128,31 @@ func (w *ChatWriter) writeResponse(data []byte) (int, error) {
 				if err != nil {
 					return 0, err
 				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+				// Write SSE frame with lower allocation: direct writes instead of fmt.Sprintf
+				_, err = w.ResponseWriter.Write([]byte("data: "))
 				if err != nil {
 					return 0, err
+				}
+				_, err = w.ResponseWriter.Write(d)
+				if err != nil {
+					return 0, err
+				}
+				_, err = w.ResponseWriter.Write([]byte("\n\n"))
+				if err != nil {
+					return 0, err
+				}
+				// Flush after usage chunk
+				if f, ok := w.ResponseWriter.(http.Flusher); ok {
+					f.Flush()
 				}
 			}
 			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
 			if err != nil {
 				return 0, err
+			}
+			// Flush after [DONE] frame
+			if f, ok := w.ResponseWriter.(http.Flusher); ok {
+				f.Flush()
 			}
 		}
 
@@ -153,6 +187,11 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 
 	// completion chunk
 	if w.stream {
+		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+		w.ResponseWriter.Header().Set("Cache-Control", "no-cache")
+		w.ResponseWriter.Header().Set("Connection", "keep-alive")
+		w.ResponseWriter.Header().Set("X-Accel-Buffering", "no")
+
 		c := openai.ToCompleteChunk(w.id, generateResponse)
 		if w.streamOptions != nil && w.streamOptions.IncludeUsage {
 			c.Usage = &openai.Usage{}
@@ -162,10 +201,22 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 			return 0, err
 		}
 
-		w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
-		_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+		// Write SSE frame with lower allocation: direct writes instead of fmt.Sprintf
+		_, err = w.ResponseWriter.Write([]byte("data: "))
 		if err != nil {
 			return 0, err
+		}
+		_, err = w.ResponseWriter.Write(d)
+		if err != nil {
+			return 0, err
+		}
+		_, err = w.ResponseWriter.Write([]byte("\n\n"))
+		if err != nil {
+			return 0, err
+		}
+		// Flush after each chunk
+		if f, ok := w.ResponseWriter.(http.Flusher); ok {
+			f.Flush()
 		}
 
 		if generateResponse.Done {
@@ -177,14 +228,31 @@ func (w *CompleteWriter) writeResponse(data []byte) (int, error) {
 				if err != nil {
 					return 0, err
 				}
-				_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("data: %s\n\n", d)))
+				// Write SSE frame with lower allocation: direct writes instead of fmt.Sprintf
+				_, err = w.ResponseWriter.Write([]byte("data: "))
 				if err != nil {
 					return 0, err
+				}
+				_, err = w.ResponseWriter.Write(d)
+				if err != nil {
+					return 0, err
+				}
+				_, err = w.ResponseWriter.Write([]byte("\n\n"))
+				if err != nil {
+					return 0, err
+				}
+				// Flush after usage chunk
+				if f, ok := w.ResponseWriter.(http.Flusher); ok {
+					f.Flush()
 				}
 			}
 			_, err = w.ResponseWriter.Write([]byte("data: [DONE]\n\n"))
 			if err != nil {
 				return 0, err
+			}
+			// Flush after [DONE] frame
+			if f, ok := w.ResponseWriter.(http.Flusher); ok {
+				f.Flush()
 			}
 		}
 
@@ -462,7 +530,24 @@ func (w *ResponsesWriter) writeEvent(eventType string, data any) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.ResponseWriter.Write([]byte(fmt.Sprintf("event: %s\ndata: %s\n\n", eventType, d)))
+	// Write event frame with lower allocation: direct writes instead of fmt.Sprintf
+	_, err = w.ResponseWriter.Write([]byte("event: "))
+	if err != nil {
+		return err
+	}
+	_, err = w.ResponseWriter.Write([]byte(eventType))
+	if err != nil {
+		return err
+	}
+	_, err = w.ResponseWriter.Write([]byte("\ndata: "))
+	if err != nil {
+		return err
+	}
+	_, err = w.ResponseWriter.Write(d)
+	if err != nil {
+		return err
+	}
+	_, err = w.ResponseWriter.Write([]byte("\n\n"))
 	if err != nil {
 		return err
 	}

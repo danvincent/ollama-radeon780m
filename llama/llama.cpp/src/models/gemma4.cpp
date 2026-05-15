@@ -173,16 +173,18 @@ llm_build_gemma4::llm_build_gemma4(const llama_model & model, const llm_graph_pa
                 ggml_tensor * fused = model.layers[il].ffn_gate_up_exps;
                 
                 // gate_exps: [n_embd, n_ff_exp, n_expert] (first half of 2nd dim)
-                gate_exps = ggml_view_3d(ctx0, fused,
+                // Wrap with ggml_cont() to make contiguous - fixes Vulkan shader issues with non-contiguous 3D weight tensors
+                gate_exps = ggml_cont(ctx0, ggml_view_3d(ctx0, fused,
                     fused->ne[0], n_ff_exp, fused->ne[2],
-                    fused->nb[1], fused->nb[2], 0);
+                    fused->nb[1], fused->nb[2], 0));
                 
                 // up_exps: [n_embd, n_ff_exp, n_expert] (second half of 2nd dim)
                 // offset by n_ff_exp elements in the 2nd dimension
-                up_exps = ggml_view_3d(ctx0, fused,
+                // Wrap with ggml_cont() to make contiguous - fixes Vulkan shader issues with non-contiguous 3D weight tensors
+                up_exps = ggml_cont(ctx0, ggml_view_3d(ctx0, fused,
                     fused->ne[0], n_ff_exp, fused->ne[2],
                     fused->nb[1], fused->nb[2], 
-                    n_ff_exp * fused->nb[1]);
+                    n_ff_exp * fused->nb[1]));
             }
 
             cur_moe = build_moe_ffn(cur_moe,

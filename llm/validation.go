@@ -105,7 +105,14 @@ func hasValidCompletionActivity(resp CompletionResponse) bool {
 	}
 
 	// Check for image generation activity (Image field or Step/TotalSteps progress)
-	if resp.Image != "" || resp.Step > 0 || resp.TotalSteps > 0 {
+	// Image field indicates we have generated image data
+	if resp.Image != "" {
+		return true
+	}
+
+	// Step > 0 indicates progress has been made in image generation
+	// (Step=0 with TotalSteps>0 just means "about to start", not real progress)
+	if resp.Step > 0 {
 		return true
 	}
 

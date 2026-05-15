@@ -88,8 +88,8 @@ func TestLibraryPathResolution(t *testing.T) {
 		buildLibExists = false
 	}
 
-	// Get the resolved library path using the shared ml package function
-	resolvedPath := ml.ResolveLibraryPath()
+	// Get the resolved library path using the shared ml package variable
+	resolvedPath := ml.LibOllamaPath
 
 	// The path must not be empty
 	if resolvedPath == "" {
@@ -135,7 +135,7 @@ func TestLibraryPathResolution(t *testing.T) {
 // This test distinguishes between successful Vulkan initialization and CPU-only fallback.
 func TestBackendInitialization(t *testing.T) {
 	// Verify library path resolution works first
-	libPath := ml.ResolveLibraryPath()
+	libPath := ml.LibOllamaPath
 	if libPath == "" {
 		t.Fatal("ResolveLibraryPath returned empty path; cannot initialize backend")
 	}
